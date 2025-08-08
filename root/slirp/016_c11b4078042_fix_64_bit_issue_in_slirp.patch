@@ -1,0 +1,886 @@
+Description: Fix 64 bit issue in slirp
+
+Origin: https://gitlab.freedesktop.org/slirp/libslirp/-/commit/c11b407804272b71e5bdd7a2a9181c64c7a594ed
+Bug-Debian: https://bugs.debian.org/949003
+Last-Update: 2020-09-02
+
+Index: slirp-1.0.17/src/ip.h
+===================================================================
+--- slirp-1.0.17.orig/src/ip.h	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/ip.h	2020-12-22 09:35:28.439604885 +0100
+@@ -187,35 +187,31 @@
+ 
+ #define	IP_MSS		576		/* default maximum segment size */
+ 
+-#ifdef HAVE_SYS_TYPES32_H  /* Overcome some Solaris 2.x junk */
+-#include <sys/types32.h>
+-#else
+ #if SIZEOF_CHAR_P == 4
+-typedef caddr_t caddr32_t;
+-#else
+-typedef void* caddr32_t;
+-#endif
+-#endif
+-
+-#if SIZEOF_CHAR_P == 4
+-typedef struct ipq *ipqp_32;
+-typedef struct ipasfrag *ipasfragp_32;
++struct mbuf_ptr {
++    struct mbuf *mptr;
++    uint32_t dummy;
++};
+ #else
+-typedef void* ipqp_32;
+-typedef void* ipasfragp_32;
++struct mbuf_ptr {
++    struct mbuf *mptr;
++};
+ #endif
++struct qlink {
++    void *next, *prev;
++};
+ 
+ /*
+  * Overlay for ip header used by other protocols (tcp, udp).
+  */
+ struct ipovly {
+-	caddr32_t	ih_next, ih_prev;	/* for protocol sequence q's */
++	struct	mbuf_ptr ih_mbuf;	/* backpointer to mbuf */
+ 	u_int8_t	ih_x1;			/* (unused) */
+ 	u_int8_t	ih_pr;			/* protocol */
+ 	int16_t	ih_len;			/* protocol length */
+ 	struct	in_addr ih_src;		/* source internet address */
+ 	struct	in_addr ih_dst;		/* destination internet address */
+-};
++} __attribute__((packed));
+ 
+ /*
+  * Ip reassembly queue structure.  Each fragment
+@@ -225,44 +221,30 @@
+  * size 28 bytes
+  */
+ struct ipq {
+-	ipqp_32 next,prev;	/* to other reass headers */
++	struct	qlink frag_link;	/* to ip headers of fragments */
++	struct	qlink ip_link;		/* to other reass headers */
+ 	u_int8_t	ipq_ttl;		/* time for reass q to live */
+ 	u_int8_t	ipq_p;			/* protocol of this fragment */
+ 	u_int16_t	ipq_id;			/* sequence id for reassembly */
+-	ipasfragp_32 ipq_next,ipq_prev;
+-					/* to ip headers of fragments */
+ 	struct	in_addr ipq_src,ipq_dst;
+ };
+ 
+ /*
+  * Ip header, when holding a fragment.
+  *
+- * Note: ipf_next must be at same offset as ipq_next above
++ * Note: ipf_link must be at same offset as frag_link above
+  */
+ struct	ipasfrag {
+-#ifdef WORDS_BIGENDIAN
+-	u_int	ip_v:4,
+- 		ip_hl:4;
+-#else
+-	u_int	ip_hl:4,
+-		ip_v:4;
+-#endif
+-                                        /* BUG : u_int changed to u_int8_t.
+-                                         * sizeof(u_int)==4 on linux 2.0
+-					 */
+-        u_int8_t ipf_mff;		/* XXX overlays ip_tos: use low bit
+-					 * to avoid destroying tos (PPPDTRuu);
+-					 * copied from (ip_off&IP_MF) */
+-	int16_t	ip_len;
+-	u_int16_t	ip_id;
+-	int16_t	ip_off;
+-	u_int8_t	ip_ttl;
+-	u_int8_t	ip_p;
+-	u_int16_t	ip_sum;
+-	ipasfragp_32 ipf_next;		/* next fragment */
+-	ipasfragp_32 ipf_prev;		/* previous fragment */
++	struct qlink ipf_link;
++	struct ip ipf_ip;
+ };
+ 
++#define ipf_off ipf_ip.ip_off
++#define ipf_tos ipf_ip.ip_tos
++#define ipf_len ipf_ip.ip_len
++#define ipf_next ipf_link.next
++#define ipf_prev ipf_link.prev
++
+ /*
+  * Structure stored in mbuf in inpcb.ip_options
+  * and passed to ip_output when ip options are in use.
+Index: slirp-1.0.17/src/ip_input.c
+===================================================================
+--- slirp-1.0.17.orig/src/ip_input.c	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/ip_input.c	2020-12-22 09:35:28.479607681 +0100
+@@ -43,12 +43,23 @@
+  */
+ 
+ #include <slirp.h>
++#include <stddef.h>
+ #include "ip_icmp.h"
+ 
++#ifndef container_of
++#define container_of(ptr, type, member)              \
++    __extension__({                                  \
++        void *__mptr = (void *)(ptr);                \
++        ((type *)(__mptr - offsetof(type, member))); \
++    })
++#endif
++
+ int ip_defttl;
+ struct ipstat ipstat;
+ struct ipq ipq;
+ 
++static struct ip *ip_reass(register struct ip *ip, register struct ipq *fp);
++
+ /*
+  * IP initialization: fill in IP protocol switch table.
+  * All protocols not implemented in kernel go to raw IP protocol handler.
+@@ -56,7 +67,7 @@
+ void
+ ip_init()
+ {
+-	ipq.next = ipq.prev = (ipqp_32)&ipq;
++	ipq.ip_link.next = ipq.ip_link.prev = &ipq.ip_link;
+ 	ip_id = tt.tv_sec & 0xffff;
+ 	udp_init();
+ 	tcp_init();
+@@ -159,18 +170,20 @@
+ 	 */
+ 	if (ip->ip_off &~ IP_DF) {
+ 	  register struct ipq *fp;
++	  struct qlink *l;
+ 		/*
+ 		 * Look for queue of fragments
+ 		 * of this datagram.
+ 		 */
+-		for (fp = (struct ipq *) ipq.next; fp != &ipq;
+-		     fp = (struct ipq *) fp->next)
++		for (l = ipq.ip_link.next; l != &ipq.ip_link; l = l->next) {
++		  fp = container_of(l, struct ipq, ip_link);
+ 		  if (ip->ip_id == fp->ipq_id &&
+ 		      ip->ip_src.s_addr == fp->ipq_src.s_addr &&
+ 		      ip->ip_dst.s_addr == fp->ipq_dst.s_addr &&
+ 		      ip->ip_p == fp->ipq_p)
+ 		    goto found;
+-		fp = 0;
++		}
++		fp = NULL;
+ 	found:
+ 
+ 		/*
+@@ -180,9 +193,9 @@
+ 		 */
+ 		ip->ip_len -= hlen;
+ 		if (ip->ip_off & IP_MF)
+-		  ((struct ipasfrag *)ip)->ipf_mff |= 1;
++		  ip->ip_tos |= 1;
+ 		else 
+-		  ((struct ipasfrag *)ip)->ipf_mff &= ~1;
++		  ip->ip_tos &= ~1;
+ 
+ 		ip->ip_off <<= 3;
+ 
+@@ -191,9 +204,9 @@
+ 		 * or if this is not the first fragment,
+ 		 * attempt reassembly; if it succeeds, proceed.
+ 		 */
+-		if (((struct ipasfrag *)ip)->ipf_mff & 1 || ip->ip_off) {
++		if (ip->ip_tos & 1 || ip->ip_off) {
+ 			ipstat.ips_fragments++;
+-			ip = ip_reass((struct ipasfrag *)ip, fp);
++			ip = ip_reass(ip, fp);
+ 			if (ip == 0)
+ 				return;
+ 			ipstat.ips_reassembled++;
+@@ -229,16 +242,15 @@
+ 	return;
+ }
+ 
++#define iptofrag(P) ((struct ipasfrag *)(((char *)(P)) - sizeof(struct qlink)))
++#define fragtoip(P) ((struct ip *)(((char *)(P)) + sizeof(struct qlink)))
+ /*
+  * Take incoming datagram fragment and try to
+  * reassemble it into whole datagram.  If a chain for
+  * reassembly of this datagram already exists, then it
+  * is given as fp; otherwise have to make a chain.
+  */
+-struct ip *
+-ip_reass(ip, fp)
+-	register struct ipasfrag *ip;
+-	register struct ipq *fp;
++static struct ip *ip_reass(register struct ip *ip, register struct ipq *fp)
+ {
+ 	register struct mbuf *m = dtom(ip);
+ 	register struct ipasfrag *q;
+@@ -265,13 +277,13 @@
+ 	  struct mbuf *t;
+ 	  if ((t = m_get()) == NULL) goto dropfrag;
+ 	  fp = mtod(t, struct ipq *);
+-	  insque_32(fp, &ipq);
++	  insque(&fp->ip_link, &ipq.ip_link);
+ 	  fp->ipq_ttl = IPFRAGTTL;
+ 	  fp->ipq_p = ip->ip_p;
+ 	  fp->ipq_id = ip->ip_id;
+-	  fp->ipq_next = fp->ipq_prev = (ipasfragp_32)fp;
+-	  fp->ipq_src = ((struct ip *)ip)->ip_src;
+-	  fp->ipq_dst = ((struct ip *)ip)->ip_dst;
++	  fp->frag_link.next = fp->frag_link.prev = &fp->frag_link;
++	  fp->ipq_src = ip->ip_src;
++	  fp->ipq_dst = ip->ip_dst;
+ 	  q = (struct ipasfrag *)fp;
+ 	  goto insert;
+ 	}
+@@ -279,9 +291,9 @@
+ 	/*
+ 	 * Find a segment which begins after this one does.
+ 	 */
+-	for (q = (struct ipasfrag *)fp->ipq_next; q != (struct ipasfrag *)fp;
+-	    q = (struct ipasfrag *)q->ipf_next)
+-		if (q->ip_off > ip->ip_off)
++	for (q = fp->frag_link.next; q != (struct ipasfrag *)&fp->frag_link;
++			q = q->ipf_next)
++		if (q->ipf_off > ip->ip_off)
+ 			break;
+ 
+ 	/*
+@@ -289,9 +301,9 @@
+ 	 * our data already.  If so, drop the data from the incoming
+ 	 * segment.  If it provides all of our data, drop us.
+ 	 */
+-	if (q->ipf_prev != (ipasfragp_32)fp) {
+-		i = ((struct ipasfrag *)(q->ipf_prev))->ip_off +
+-		  ((struct ipasfrag *)(q->ipf_prev))->ip_len - ip->ip_off;
++	if (q->ipf_prev != &fp->frag_link) {
++		struct ipasfrag *pq = q->ipf_prev;
++		i = pq->ipf_off + pq->ipf_len - ip->ip_off;
+ 		if (i > 0) {
+ 			if (i >= ip->ip_len)
+ 				goto dropfrag;
+@@ -305,17 +317,18 @@
+ 	 * While we overlap succeeding segments trim them or,
+ 	 * if they are completely covered, dequeue them.
+ 	 */
+-	while (q != (struct ipasfrag *)fp && ip->ip_off + ip->ip_len > q->ip_off) {
+-		i = (ip->ip_off + ip->ip_len) - q->ip_off;
+-		if (i < q->ip_len) {
+-			q->ip_len -= i;
+-			q->ip_off += i;
++	while (q != (struct ipasfrag *)&fp->frag_link &&
++			ip->ip_off + ip->ip_len > q->ipf_off) {
++		i = (ip->ip_off + ip->ip_len) - q->ipf_off;
++		if (i < q->ipf_len) {
++			q->ipf_len -= i;
++			q->ipf_off += i;
+ 			m_adj(dtom(q), i);
+ 			break;
+ 		}
+-		q = (struct ipasfrag *) q->ipf_next;
+-		m_freem(dtom((struct ipasfrag *) q->ipf_prev));
+-		ip_deq((struct ipasfrag *) q->ipf_prev);
++		q = q->ipf_next;
++		m_freem(dtom(q->ipf_prev));
++		ip_deq(q->ipf_prev);
+ 	}
+ 
+ insert:
+@@ -323,27 +336,26 @@
+ 	 * Stick new segment in its place;
+ 	 * check for complete reassembly.
+ 	 */
+-	ip_enq(ip, (struct ipasfrag *) q->ipf_prev);
++	ip_enq(iptofrag(ip), q->ipf_prev);
+ 	next = 0;
+-	for (q = (struct ipasfrag *) fp->ipq_next; q != (struct ipasfrag *)fp;
+-	     q = (struct ipasfrag *) q->ipf_next) {
+-		if (q->ip_off != next)
++	for (q = fp->frag_link.next; q != (struct ipasfrag *)&fp->frag_link;
++			q = q->ipf_next) {
++		if (q->ipf_off != next)
+ 			return (0);
+-		next += q->ip_len;
++		next += q->ipf_len;
+ 	}
+-	if (((struct ipasfrag *)(q->ipf_prev))->ipf_mff & 1)
++	if (((struct ipasfrag *)(q->ipf_prev))->ipf_tos & 1)
+ 		return (0);
+ 
+ 	/*
+ 	 * Reassembly is complete; concatenate fragments.
+ 	 */
+-	q = (struct ipasfrag *) fp->ipq_next;
++	q = fp->frag_link.next;
+ 	m = dtom(q);
+ 
+ 	q = (struct ipasfrag *) q->ipf_next;
+-	while (q != (struct ipasfrag *)fp) {
+-	  struct mbuf *t;
+-	  t = dtom(q);
++	while (q != (struct ipasfrag *)&fp->frag_link) {
++	  struct mbuf *t = dtom(q);
+ 	  m_cat(m, t);
+ 	  q = (struct ipasfrag *) q->ipf_next;
+ 	}
+@@ -354,7 +366,7 @@
+ 	 * dequeue and discard fragment reassembly header.
+ 	 * Make header visible.
+ 	 */
+-	ip = (struct ipasfrag *) fp->ipq_next;
++	q = fp->frag_link.next;
+ 
+ 	/*
+ 	 * If the fragments concatenated to an mbuf that's
+@@ -366,23 +378,23 @@
+ 	if (m->m_flags & M_EXT) {
+ 	  int delta;
+ 	  delta = (char *)ip - m->m_dat;
+-	  ip = (struct ipasfrag *)(m->m_ext + delta);
++	  q = (struct ipasfrag *)(m->m_ext + delta);
+ 	}
+ 
+ 	/* DEBUG_ARG("ip = %lx", (long)ip); 
+ 	 * ip=(struct ipasfrag *)m->m_data; */
+ 
++	ip = fragtoip(q);
+ 	ip->ip_len = next;
+-	ip->ipf_mff &= ~1;
+-	((struct ip *)ip)->ip_src = fp->ipq_src;
+-	((struct ip *)ip)->ip_dst = fp->ipq_dst;
+-	remque_32(fp);
++	ip->ip_tos &= ~1;
++	ip->ip_src = fp->ipq_src;
++	ip->ip_dst = fp->ipq_dst;
++	remque(&fp->ip_link);
+ 	(void) m_free(dtom(fp));
+-	m = dtom(ip);
+ 	m->m_len += (ip->ip_hl << 2);
+ 	m->m_data -= (ip->ip_hl << 2);
+ 
+-	return ((struct ip *)ip);
++	return ip;
+ 
+ dropfrag:
+ 	ipstat.ips_fragdropped++;
+@@ -400,13 +412,13 @@
+ {
+ 	register struct ipasfrag *q, *p;
+ 
+-	for (q = (struct ipasfrag *) fp->ipq_next; q != (struct ipasfrag *)fp;
++	for (q = fp->frag_link.next; q != (struct ipasfrag *)&fp->frag_link;
+ 	    q = p) {
+-		p = (struct ipasfrag *) q->ipf_next;
++		p = q->ipf_next;
+ 		ip_deq(q);
+ 		m_freem(dtom(q));
+ 	}
+-	remque_32(fp);
++	remque(&fp->ip_link);
+ 	(void) m_free(dtom(fp));
+ }
+ 
+@@ -420,10 +432,10 @@
+ {
+ 	DEBUG_CALL("ip_enq");
+ 	DEBUG_ARG("prev = %lx", (long)prev);
+-	p->ipf_prev = (ipasfragp_32) prev;
++	p->ipf_prev = prev;
+ 	p->ipf_next = prev->ipf_next;
+-	((struct ipasfrag *)(prev->ipf_next))->ipf_prev = (ipasfragp_32) p;
+-	prev->ipf_next = (ipasfragp_32) p;
++	((struct ipasfrag *)(prev->ipf_next))->ipf_prev = p;
++	prev->ipf_next = p;
+ }
+ 
+ /*
+@@ -445,20 +457,21 @@
+ void
+ ip_slowtimo()
+ {
+-	register struct ipq *fp;
++	struct qlink *l;
+ 	
+ 	DEBUG_CALL("ip_slowtimo");
+ 	
+-	fp = (struct ipq *) ipq.next;
+-	if (fp == 0)
++	l = ipq.ip_link.next;
++
++	if (l == 0)
+ 	   return;
+ 
+-	while (fp != &ipq) {
+-		--fp->ipq_ttl;
+-		fp = (struct ipq *) fp->next;
+-		if (((struct ipq *)(fp->prev))->ipq_ttl == 0) {
++	while (l != &ipq.ip_link) {
++		struct ipq *fp = container_of(l, struct ipq, ip_link);
++		l = l->next;
++		if (--fp->ipq_ttl == 0) {
+ 			ipstat.ips_fragtimeout++;
+-			ip_freef((struct ipq *) fp->prev);
++			ip_freef(fp);
+ 		}
+ 	}
+ }
+Index: slirp-1.0.17/src/main.c
+===================================================================
+--- slirp-1.0.17.orig/src/main.c	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/main.c	2020-12-22 09:35:28.495608800 +0100
+@@ -760,8 +760,8 @@
+ 		 * *_slowtimo needs calling if there are IP fragments
+ 		 * in the fragment queue, or there are TCP connections active
+ 		 */
+-		do_slowtimo = ((tcb.so_next != &tcb) ||
+-			       ((struct ipasfrag *)&ipq != (struct ipasfrag *)ipq.next));
++		do_slowtimo =
++			((tcb.so_next != &tcb) || (&ipq.ip_link != ipq.ip_link.next));
+ 
+ 		for (so = tcb.so_next; so != &tcb; so = so_next) {
+ 			so_next = so->so_next;
+Index: slirp-1.0.17/src/misc.c
+===================================================================
+--- slirp-1.0.17.orig/src/misc.c	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/misc.c	2020-12-22 09:48:19.000000000 +0100
+@@ -98,39 +98,6 @@
+ 	our_addr = *(struct in_addr *)he->h_addr;
+ }
+ 
+-#if SIZEOF_CHAR_P == 8
+-
+-struct quehead_32 {
+-	u_int32_t qh_link;
+-	u_int32_t qh_rlink;
+-};
+-
+-inline void
+-insque_32(a, b)
+-	void *a;
+-	void *b;
+-{
+-	register struct quehead_32 *element = (struct quehead_32 *) a;
+-	register struct quehead_32 *head = (struct quehead_32 *) b;
+-	element->qh_link = head->qh_link;
+-	head->qh_link = (u_int32_t)element;
+-	element->qh_rlink = (u_int32_t)head;
+-	((struct quehead_32 *)(element->qh_link))->qh_rlink
+-	= (u_int32_t)element;
+-}
+-
+-inline void
+-remque_32(a)
+-	void *a;
+-{
+-	register struct quehead_32 *element = (struct quehead_32 *) a;
+-	((struct quehead_32 *)(element->qh_link))->qh_rlink = element->qh_rlink;
+-	((struct quehead_32 *)(element->qh_rlink))->qh_link = element->qh_link;
+-	element->qh_rlink = 0;
+-}
+-
+-#endif /* SIZEOF_CHAR_P == 8 */
+-
+ struct quehead {
+ 	struct quehead *qh_link;
+ 	struct quehead *qh_rlink;
+Index: slirp-1.0.17/src/slirp.h
+===================================================================
+--- slirp-1.0.17.orig/src/slirp.h	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/slirp.h	2020-12-22 09:35:28.499609080 +0100
+@@ -244,14 +244,6 @@
+ 
+ extern int do_echo;
+ 
+-#if SIZEOF_CHAR_P == 4
+-# define insque_32 insque
+-# define remque_32 remque
+-#else
+- inline void insque_32 _P((void *, void *));
+- inline void remque_32 _P((void *));
+-#endif
+-
+ #include <pwd.h>
+ #include <netdb.h>
+ 
+Index: slirp-1.0.17/src/tcp_input.c
+===================================================================
+--- slirp-1.0.17.orig/src/tcp_input.c	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/tcp_input.c	2020-12-22 09:35:28.503609360 +0100
+@@ -72,47 +72,49 @@
+  * when segments are out of order (so fast retransmit can work).
+  */
+ #ifdef TCP_ACK_HACK
+-#define TCP_REASS(tp, ti, m, so, flags) {\
+-       if ((ti)->ti_seq == (tp)->rcv_nxt && \
+-           (tp)->seg_next == (tcpiphdrp_32)(tp) && \
+-           (tp)->t_state == TCPS_ESTABLISHED) {\
+-               if (ti->ti_flags & TH_PUSH) \
+-                       tp->t_flags |= TF_ACKNOW; \
+-               else \
+-                       tp->t_flags |= TF_DELACK; \
+-               (tp)->rcv_nxt += (ti)->ti_len; \
+-               flags = (ti)->ti_flags & TH_FIN; \
+-               tcpstat.tcps_rcvpack++;\
+-               tcpstat.tcps_rcvbyte += (ti)->ti_len;\
+-               if (so->so_emu) { \
+-		       if (tcp_emu((so),(m))) sbappend((so), (m)); \
+-	       } else \
+-	       	       sbappend((so), (m)); \
+-/*               sorwakeup(so); */ \
+-	} else {\
+-               (flags) = tcp_reass((tp), (ti), (m)); \
+-               tp->t_flags |= TF_ACKNOW; \
+-       } \
++#define TCP_REASS(tp, ti, m, so, flags)                                \
++    {                                                                  \
++        if ((ti)->ti_seq == (tp)->rcv_nxt && tcpfrag_list_empty(tp) && \
++            (tp)->t_state == TCPS_ESTABLISHED) {                       \
++            if (ti->ti_flags & TH_PUSH)                                \
++                tp->t_flags |= TF_ACKNOW;                              \
++            else                                                       \
++                tp->t_flags |= TF_DELACK;                              \
++            (tp)->rcv_nxt += (ti)->ti_len;                             \
++            flags = (ti)->ti_flags & TH_FIN;                           \
++            tcpstat.tcps_rcvpack++;                                    \
++            tcpstat.tcps_rcvbyte += (ti)->ti_len;                      \
++            if (so->so_emu) {                                          \
++                if (tcp_emu((so), (m)))                                \
++                    sbappend((so), (m));                               \
++            } else                                                     \
++                sbappend((so), (m));                                   \
++            /*               sorwakeup(so); */                         \
++        } else {                                                       \
++            (flags) = tcp_reass((tp), (ti), (m));                      \
++            tp->t_flags |= TF_ACKNOW;                                  \
++        }                                                              \
+ }
+ #else
+-#define	TCP_REASS(tp, ti, m, so, flags) { \
+-	if ((ti)->ti_seq == (tp)->rcv_nxt && \
+-	    (tp)->seg_next == (tcpiphdrp_32)(tp) && \
+-	    (tp)->t_state == TCPS_ESTABLISHED) { \
+-		tp->t_flags |= TF_DELACK; \
+-		(tp)->rcv_nxt += (ti)->ti_len; \
+-		flags = (ti)->ti_flags & TH_FIN; \
+-		tcpstat.tcps_rcvpack++;\
+-		tcpstat.tcps_rcvbyte += (ti)->ti_len;\
+-		if (so->so_emu) { \
+-			if (tcp_emu((so),(m))) sbappend(so, (m)); \
+-		} else \
+-			sbappend((so), (m)); \
+-/*		sorwakeup(so); */ \
+-	} else { \
+-		(flags) = tcp_reass((tp), (ti), (m)); \
+-		tp->t_flags |= TF_ACKNOW; \
+-	} \
++#define TCP_REASS(tp, ti, m, so, flags)                                \
++    {                                                                  \
++        if ((ti)->ti_seq == (tp)->rcv_nxt && tcpfrag_list_empty(tp) && \
++            (tp)->t_state == TCPS_ESTABLISHED) {                       \
++            tp->t_flags |= TF_DELACK;                                  \
++            (tp)->rcv_nxt += (ti)->ti_len;                             \
++            flags = (ti)->ti_flags & TH_FIN;                           \
++            tcpstat.tcps_rcvpack++;                                    \
++            tcpstat.tcps_rcvbyte += (ti)->ti_len;                      \
++            if (so->so_emu) {                                          \
++                if (tcp_emu((so), (m)))                                \
++                    sbappend(so, (m));                                 \
++            } else                                                     \
++                sbappend((so), (m));                                   \
++            /*		sorwakeup(so); */                                      \
++        } else {                                                       \
++            (flags) = tcp_reass((tp), (ti), (m));                      \
++            tp->t_flags |= TF_ACKNOW;                                  \
++        }                                                              \
+ }
+ #endif
+ 
+@@ -136,8 +138,8 @@
+ 	/*
+ 	 * Find a segment which begins after this one does.
+ 	 */
+-	for (q = (struct tcpiphdr *)tp->seg_next; q != (struct tcpiphdr *)tp;
+-	    q = (struct tcpiphdr *)q->ti_next)
++	for (q = tcpfrag_list_first(tp); !tcpfrag_list_end(q, tp);
++	    q = tcpiphdr_next(q))
+ 		if (SEQ_GT(q->ti_seq, ti->ti_seq))
+ 			break;
+ 
+@@ -146,9 +148,9 @@
+ 	 * our data already.  If so, drop the data from the incoming
+ 	 * segment.  If it provides all of our data, drop us.
+ 	 */
+-	if ((struct tcpiphdr *)q->ti_prev != (struct tcpiphdr *)tp) {
++	if (!tcpfrag_list_end(tcpiphdr_prev(q), tp)) {
+ 		register int i;
+-		q = (struct tcpiphdr *)q->ti_prev;
++		q = tcpiphdr_prev(q);
+ 		/* conversion to int (in i) handles seq wraparound */
+ 		i = q->ti_seq + q->ti_len - ti->ti_seq;
+ 		if (i > 0) {
+@@ -168,36 +170,36 @@
+ 			ti->ti_len -= i;
+ 			ti->ti_seq += i;
+ 		}
+-		q = (struct tcpiphdr *)(q->ti_next);
++		q = tcpiphdr_next(q);
+ 	}
+ 	tcpstat.tcps_rcvoopack++;
+ 	tcpstat.tcps_rcvoobyte += ti->ti_len;
+-	REASS_MBUF(ti) = (mbufp_32) m;		/* XXX */
++	ti->ti_mbuf = m;
+ 
+ 	/*
+ 	 * While we overlap succeeding segments trim them or,
+ 	 * if they are completely covered, dequeue them.
+ 	 */
+-	while (q != (struct tcpiphdr *)tp) {
++	while (!tcpfrag_list_end(q, tp)) {
+ 		register int i = (ti->ti_seq + ti->ti_len) - q->ti_seq;
+ 		if (i <= 0)
+ 			break;
+ 		if (i < q->ti_len) {
+ 			q->ti_seq += i;
+ 			q->ti_len -= i;
+-			m_adj((struct mbuf *) REASS_MBUF(q), i);
++			m_adj(q->ti_mbuf, i);
+ 			break;
+ 		}
+-		q = (struct tcpiphdr *)q->ti_next;
+-		m = (struct mbuf *) REASS_MBUF((struct tcpiphdr *)q->ti_prev);
+-		remque_32((void *)(q->ti_prev));
++		q = tcpiphdr_next(q);
++		m = tcpiphdr_prev(q)->ti_mbuf;
++		remque(tcpiphdr2qlink(tcpiphdr_prev(q)));
+ 		m_freem(m);
+ 	}
+ 
+ 	/*
+ 	 * Stick new segment in its place.
+ 	 */
+-	insque_32(ti, (void *)(q->ti_prev));
++	insque(tcpiphdr2qlink(ti), tcpiphdr2qlink(tcpiphdr_prev(q)));
+ 
+ present:
+ 	/*
+@@ -206,17 +208,17 @@
+ 	 */
+ 	if (!TCPS_HAVEESTABLISHED(tp->t_state))
+ 		return (0);
+-	ti = (struct tcpiphdr *) tp->seg_next;
+-	if (ti == (struct tcpiphdr *)tp || ti->ti_seq != tp->rcv_nxt)
++	ti = tcpfrag_list_first(tp);
++	if (tcpfrag_list_end(ti, tp) || ti->ti_seq != tp->rcv_nxt)
+ 		return (0);
+ 	if (tp->t_state == TCPS_SYN_RECEIVED && ti->ti_len)
+ 		return (0);
+ 	do {
+ 		tp->rcv_nxt += ti->ti_len;
+ 		flags = ti->ti_flags & TH_FIN;
+-		remque_32(ti);
+-		m = (struct mbuf *) REASS_MBUF(ti); /* XXX */
+-		ti = (struct tcpiphdr *)ti->ti_next;
++		remque(tcpiphdr2qlink(ti));
++		m = ti->ti_mbuf;
++		ti = tcpiphdr_next(ti);
+ /*		if (so->so_state & SS_FCANTRCVMORE) */
+ 		if (so->so_state & SS_FCANTSENDMORE)
+ 			m_freem(m);
+@@ -303,7 +305,8 @@
+ 	 * Checksum extended TCP header and data.
+ 	 */
+ 	tlen = ((struct ip *)ti)->ip_len;
+-	ti->ti_next = ti->ti_prev = 0;
++	tcpiphdr2qlink(ti)->next = tcpiphdr2qlink(ti)->prev = 0;
++	memset(&ti->ti_i.ih_mbuf, 0, sizeof(struct mbuf_ptr));
+ 	ti->ti_x1 = 0;
+ 	ti->ti_len = htons((u_int16_t)tlen);
+ 	len = sizeof(struct ip ) + tlen;
+@@ -551,8 +554,7 @@
+ 
+ 				return;
+ 			}
+-		} else if (ti->ti_ack == tp->snd_una &&
+-		    tp->seg_next == (tcpiphdrp_32)tp &&
++		} else if (ti->ti_ack == tp->snd_una && tcpfrag_list_empty(tp) &&
+ 		    ti->ti_len <= sbspace(&so->so_rcv)) {
+ 			/*
+ 			 * this is a pure, in-sequence data packet
+Index: slirp-1.0.17/src/tcp_subr.c
+===================================================================
+--- slirp-1.0.17.orig/src/tcp_subr.c	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/tcp_subr.c	2020-12-22 09:48:19.000000000 +0100
+@@ -84,7 +84,7 @@
+ 	struct socket *so = tp->t_socket;
+ 	register struct tcpiphdr *n = &tp->t_template;
+ 
+-	n->ti_next = n->ti_prev = 0;
++	n->ti_mbuf = NULL;
+ 	n->ti_x1 = 0;
+ 	n->ti_pr = IPPROTO_TCP;
+ 	n->ti_len = htons(sizeof (struct tcpiphdr) - sizeof (struct ip));
+@@ -167,7 +167,7 @@
+ 	tlen += sizeof (struct tcpiphdr);
+ 	m->m_len = tlen;
+ 
+-	ti->ti_next = ti->ti_prev = 0;
++	ti->ti_mbuf = 0;
+ 	ti->ti_x1 = 0;
+ 	ti->ti_seq = htonl(seq);
+ 	ti->ti_ack = htonl(ack);
+@@ -207,7 +207,7 @@
+ 		return ((struct tcpcb *)0);
+ 
+ 	memset((char *) tp, 0, sizeof(struct tcpcb));
+-	tp->seg_next = tp->seg_prev = (tcpiphdrp_32)tp;
++	tp->seg_next = tp->seg_prev = (struct tcpiphdr *)tp;
+ 	tp->t_maxseg = tcp_mssdflt;
+ 
+ 	tp->t_flags = tcp_do_rfc1323 ? (TF_REQ_SCALE|TF_REQ_TSTMP) : 0;
+@@ -284,11 +284,11 @@
+ 	DEBUG_ARG("tp = %lx", (long )tp);
+ 
+ 	/* free the reassembly queue, if any */
+-	t = (struct tcpiphdr *) tp->seg_next;
+-	while (t != (struct tcpiphdr *)tp) {
+-		t = (struct tcpiphdr *)t->ti_next;
+-		m = (struct mbuf *) REASS_MBUF((struct tcpiphdr *)t->ti_prev);
+-		remque_32((struct tcpiphdr *) t->ti_prev);
++	t = tcpfrag_list_first(tp);
++	while (!tcpfrag_list_end(t, tp)) {
++		t = tcpiphdr_next(t);
++		m = tcpiphdr_prev(t)->ti_mbuf;
++		remque(tcpiphdr2qlink(tcpiphdr_prev(t)));
+ 		m_freem(m);
+ 	}
+ 	/* It's static */
+Index: slirp-1.0.17/src/tcp_var.h
+===================================================================
+--- slirp-1.0.17.orig/src/tcp_var.h	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/tcp_var.h	2020-12-22 09:35:28.503609360 +0100
+@@ -40,18 +40,12 @@
+ #include "tcpip.h"
+ #include "tcp_timer.h"
+ 
+-#if SIZEOF_CHAR_P == 4
+- typedef struct tcpiphdr *tcpiphdrp_32;
+-#else
+- typedef void* tcpiphdrp_32;
+-#endif
+-
+ /*
+  * Tcp control block, one per tcp; fields:
+  */
+ struct tcpcb {
+-	tcpiphdrp_32 seg_next;	/* sequencing queue */
+-	tcpiphdrp_32 seg_prev;
++	struct tcpiphdr *seg_next; /* sequencing queue */
++	struct tcpiphdr *seg_prev;
+ 	short	t_state;		/* state of this connection */
+ 	short	t_timer[TCPT_NTIMERS];	/* tcp timers */
+ 	short	t_rxtshift;		/* log(2) of rexmt exp. backoff */
+@@ -170,21 +164,6 @@
+ #define	TCP_REXMTVAL(tp) \
+ 	(((tp)->t_srtt >> TCP_RTT_SHIFT) + (tp)->t_rttvar)
+ 
+-/* XXX
+- * We want to avoid doing m_pullup on incoming packets but that
+- * means avoiding dtom on the tcp reassembly code.  That in turn means
+- * keeping an mbuf pointer in the reassembly queue (since we might
+- * have a cluster).  As a quick hack, the source & destination
+- * port numbers (which are no longer needed once we've located the
+- * tcpcb) are overlayed with an mbuf pointer.
+- */
+-#if SIZEOF_CHAR_P == 4
+-typedef struct mbuf *mbufp_32;
+-#else
+-typedef void* mbufp_32;
+-#endif
+-#define REASS_MBUF(ti) (*(mbufp_32 *)&((ti)->ti_t))
+-
+ /*
+  * TCP statistics.
+  * Many of these should be kept per connection,
+Index: slirp-1.0.17/src/tcpip.h
+===================================================================
+--- slirp-1.0.17.orig/src/tcpip.h	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/tcpip.h	2020-12-22 09:35:28.511609919 +0100
+@@ -44,8 +44,7 @@
+ 	struct 	ipovly ti_i;		/* overlaid ip structure */
+ 	struct	tcphdr ti_t;		/* tcp header */
+ };
+-#define	ti_next		ti_i.ih_next
+-#define	ti_prev		ti_i.ih_prev
++#define	ti_mbuf		ti_i.ih_mbuf.mptr
+ #define	ti_x1		ti_i.ih_x1
+ #define	ti_pr		ti_i.ih_pr
+ #define	ti_len		ti_i.ih_len
+@@ -62,6 +61,16 @@
+ #define	ti_sum		ti_t.th_sum
+ #define	ti_urp		ti_t.th_urp
+ 
++#define tcpiphdr2qlink(T) \
++    ((struct qlink *)(((char *)(T)) - sizeof(struct qlink)))
++#define qlink2tcpiphdr(Q) \
++    ((struct tcpiphdr *)(((char *)(Q)) + sizeof(struct qlink)))
++#define tcpiphdr_next(T) qlink2tcpiphdr(tcpiphdr2qlink(T)->next)
++#define tcpiphdr_prev(T) qlink2tcpiphdr(tcpiphdr2qlink(T)->prev)
++#define tcpfrag_list_first(T) qlink2tcpiphdr((T)->seg_next)
++#define tcpfrag_list_end(F, T) (tcpiphdr2qlink(F) == (struct qlink *)(T))
++#define tcpfrag_list_empty(T) ((T)->seg_next == (struct tcpiphdr *)(T))
++
+ /*
+  * Just a clean way to get to the first byte
+  * of the packet
+Index: slirp-1.0.17/src/udp.c
+===================================================================
+--- slirp-1.0.17.orig/src/udp.c	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/udp.c	2020-12-22 09:35:28.511609919 +0100
+@@ -131,8 +131,7 @@
+ 	 * Checksum extended UDP header and data.
+ 	 */
+ 	if (udpcksum && uh->uh_sum) {
+-	  ((struct ipovly *)ip)->ih_next = 0;
+-	  ((struct ipovly *)ip)->ih_prev = 0;
++	  memset(&((struct ipovly *)ip)->ih_mbuf, 0, sizeof(struct mbuf_ptr));
+ 	  ((struct ipovly *)ip)->ih_x1 = 0;
+ 	  ((struct ipovly *)ip)->ih_len = uh->uh_ulen;
+ 	  /* keep uh_sum for ICMP reply
+@@ -259,7 +258,7 @@
+ 	 * and addresses and length put into network format.
+ 	 */
+ 	ui = mtod(m, struct udpiphdr *);
+-	ui->ui_next = ui->ui_prev = 0;
++	memset(&ui->ui_i.ih_mbuf, 0, sizeof(struct mbuf_ptr));
+ 	ui->ui_x1 = 0;
+ 	ui->ui_pr = IPPROTO_UDP;
+ 	ui->ui_len = htons(m->m_len - sizeof(struct ip)); /* + sizeof (struct udphdr)); */
+Index: slirp-1.0.17/src/udp.h
+===================================================================
+--- slirp-1.0.17.orig/src/udp.h	2020-12-22 09:35:28.515610199 +0100
++++ slirp-1.0.17/src/udp.h	2020-12-22 09:35:28.511609919 +0100
+@@ -60,8 +60,7 @@
+ 	        struct  ipovly ui_i;            /* overlaid ip structure */
+ 	        struct  udphdr ui_u;            /* udp header */
+ };
+-#define ui_next         ui_i.ih_next
+-#define ui_prev         ui_i.ih_prev
++#define ui_mbuf         ui_i.ih_mbuf.mptr
+ #define ui_x1           ui_i.ih_x1
+ #define ui_pr           ui_i.ih_pr
+ #define ui_len          ui_i.ih_len
+Index: slirp-1.0.17/src/ip_input.p
+===================================================================
+--- slirp-1.0.17.orig/src/ip_input.p	2004-09-01 13:00:03.000000000 +0200
++++ slirp-1.0.17/src/ip_input.p	2020-12-22 09:48:31.458415569 +0100
+@@ -1,6 +1,7 @@
+ void ip_init _P((void));
+ void ip_input _P((struct mbuf *));
+-struct ip * ip_reass _P((register struct ipasfrag *, register struct ipq *));
++//struct ip * ip_reass _P((register struct ipasfrag *, register struct ipq *));
++static struct ip *ip_reass(register struct ip *ip, register struct ipq *fp);
+ void ip_freef _P((struct ipq *));
+ void ip_enq _P((register struct ipasfrag *, register struct ipasfrag *));
+ void ip_deq _P((register struct ipasfrag *));

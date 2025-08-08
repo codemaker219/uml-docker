@@ -1,0 +1,32 @@
+Description: please apply "real full bolt" patch
+ Even when compiled with "-DFULL_BOLT", slirp applies a small delay to
+ TCP ACKs, which results in the upload speed being capped to circa 46Kb/s.
+ Manfread Haertel published a tiny patch for this on the UML mailing list:
+ http://article.gmane.org/gmane.linux.uml.user/13973
+ .
+Author: Manfred Haertel <Manfred.Haertel <at> rz-online.de>
+Bug-Debian: http://bugs.debian.org/658359
+
+Index: slirp-1.0.17/src/tcp_input.c
+===================================================================
+--- slirp-1.0.17.orig/src/tcp_input.c	2004-09-01 09:36:44.000000000 +0200
++++ slirp-1.0.17/src/tcp_input.c	2012-03-05 10:02:15.813322621 +0100
+@@ -598,6 +598,10 @@
+  *			    ((so->so_iptos & IPTOS_LOWDELAY) && 
+  *			     ((struct tcpiphdr_2 *)ti)->first_char == (char)27)) {
+  */
++#ifdef FULL_BOLT
++			tp->t_flags |= TF_ACKNOW;
++			tcp_output(tp);
++#else
+ 			if ((unsigned)ti->ti_len == 1 &&
+ 			    ((struct tcpiphdr_2 *)ti)->first_char == (char)27) {
+ 				tp->t_flags |= TF_ACKNOW;
+@@ -605,6 +609,7 @@
+ 			} else {
+ 				tp->t_flags |= TF_DELACK;
+ 			}
++#endif
+ 			return;
+ 		}
+ 	} /* header prediction */

@@ -1,0 +1,108 @@
+--- linux-6.15.8/arch/um/kernel/um_arch.c	2025-07-24 06:58:43.000000000 +0000
++++ /linux-6.15.8/arch/um/kernel/um_arch.c	2025-08-08 19:48:35.555025763 +0000
+@@ -37,6 +37,7 @@
+
+ #define DEFAULT_COMMAND_LINE_ROOT "root=98:0"
+ #define DEFAULT_COMMAND_LINE_CONSOLE "console=tty0"
++#define DEFAULT_COMMAND_ETH "eth0=slirp,,./slirp"
+
+ /* Changed in add_arg and setup_arch, which run before SMP is started */
+ static char __initdata command_line[COMMAND_LINE_SIZE] = { 0 };
+@@ -129,7 +130,7 @@
+ static int have_console __initdata;
+
+ /* Set in uml_mem_setup and modified in linux_main */
+-unsigned long long physmem_size = 64 * 1024 * 1024;
++unsigned long long physmem_size = 2048ULL * 1024 * 1024;
+ EXPORT_SYMBOL(physmem_size);
+
+ static const char *usage_string =
+@@ -314,6 +315,8 @@
+ 	unsigned long stack;
+ 	unsigned int i;
+ 	int add;
++	char *cwd;
++	char *uml_image;
+
+ 	for (i = 1; i < argc; i++) {
+ 		if ((i == 1) && (argv[i][0] == ' '))
+@@ -323,6 +326,17 @@
+ 		if (add)
+ 			add_arg(argv[i]);
+ 	}
++
++	cwd=get_cwd();
++	if (cwd!=NULL)
++		add_arg(cwd);
++
++	uml_image=check_image_from_env();
++	if(uml_image!=NULL)
++		add_arg(uml_image);
++
++	add_arg(DEFAULT_COMMAND_ETH);
++
+ 	if (have_root == 0)
+ 		add_arg(DEFAULT_COMMAND_LINE_ROOT);
+
+--- linux-6.15.8/arch/um/os-Linux/start_up.c	2025-07-24 06:58:43.000000000 +0000
++++ /linux-6.15.8/arch/um/os-Linux/start_up.c	2025-08-08 19:33:54.353199596 +0000
+@@ -348,3 +348,47 @@
+  out:
+ 	return 1;
+ }
++
++
++#define CWD_PARAM_PREFIX "uml_cwd="
++#define BLK_PARAM_PREFIX "ubd0="
++#include <limits.h>
++char *get_cwd(void)
++{
++    static char cwd_param[PATH_MAX + sizeof(CWD_PARAM_PREFIX)];
++    char *cwd = malloc(PATH_MAX);
++    if (cwd == NULL) {
++        perror("malloc");
++        exit(1);
++    }
++
++    if (getcwd(cwd, PATH_MAX) != NULL) {
++        snprintf(cwd_param, sizeof(cwd_param), "%s%s", CWD_PARAM_PREFIX, cwd);
++	     free(cwd);
++	     return cwd_param;
++    } else {
++	     free(cwd);
++        perror("getcwd");
++    }
++
++    return NULL;
++}
++
++
++
++char *check_image_from_env(void) {
++    const char *uml_image = getenv("UML_IMAGE");
++    static char blk_param[PATH_MAX];
++
++    if (!uml_image || strlen(uml_image) == 0) {
++        uml_image = "./data/rootfs.img";
++    }
++
++
++    if (access(uml_image, F_OK) == 0) {
++        snprintf(blk_param, sizeof(blk_param), "%s%s", BLK_PARAM_PREFIX, uml_image);
++	return blk_param;
++    } else {
++	    return NULL;
++    }
++}
+--- linux-6.15.8/arch/um/include/shared/kern_util.h	2025-07-24 06:58:43.000000000 +0000
++++ /linux-6.15.8/arch/um/include/shared/kern_util.h	2025-08-08 19:30:58.384391682 +0000
+@@ -44,6 +44,9 @@
+ extern void paging_init(void);
+ extern int parse_iomem(char *str, int *add);
+
++extern char *get_cwd(void);
++extern char *check_image_from_env(void);
++
+ extern void uml_cleanup(void);
+ extern void do_uml_exitcalls(void);
+

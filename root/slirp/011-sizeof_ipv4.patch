@@ -1,0 +1,52 @@
+Description: IPCP negotiation fails for 64-bit hosts
+ Due to incorrect use of "sizeof(long)" in src/ppp/ipcp.c, a 64-bit host
+ may send back incorrect IPCP NAKs in response to a client sending an IPCP
+ configure request that includes DNS/WINS options.
+ The NAK response offers an incorrect IP address and no DNS IPs, which
+ eventually causes negotiation to fail.
+ Proposed solution is to change "sizeof (long)" to "sizeof (u_int32_t)" to
+ correctly match the length of IPV4 addresses.
+ .
+Author: Tueidj Traden <tueidj <at> hotmail.com>
+Bug-Debian: http://bugs.debian.org/685056
+
+Index: slirp-1.0.17/src/ppp/ipcp.c
+===================================================================
+--- slirp-1.0.17.orig/src/ppp/ipcp.c	2012-03-05 10:04:03.437397424 +0100
++++ slirp-1.0.17/src/ppp/ipcp.c	2012-08-16 11:29:19.529949712 +0200
+@@ -881,7 +881,7 @@
+ 	    }
+ 	    GETLONG(tl,p);
+ 	    if (htonl(tl) != wo->dnsaddr[0]) {
+-                DECPTR(sizeof (long),p);
++                DECPTR(sizeof (u_int32_t),p);
+ 		tl = ntohl(wo->dnsaddr[0]);
+ 		PUTLONG(tl, p);
+ 		orc = CONFNAK;
+@@ -899,7 +899,7 @@
+ 	    }
+ 	    GETLONG(tl,p);
+ 	    if (htonl(tl) != wo->winsaddr[0]) {
+-                DECPTR(sizeof (long),p);
++                DECPTR(sizeof (u_int32_t),p);
+ 		tl = ntohl(wo->winsaddr[0]);
+ 		PUTLONG(tl, p);
+ 		orc = CONFNAK;
+@@ -917,7 +917,7 @@
+ 	    }
+ 	    GETLONG(tl,p);
+ 	    if (htonl(tl) != wo->dnsaddr[1]) { /* and this is the 2nd one */
+-                DECPTR(sizeof (long),p);
++                DECPTR(sizeof (u_int32_t),p);
+ 		tl = ntohl(wo->dnsaddr[1]);
+ 		PUTLONG(tl, p);
+ 		orc = CONFNAK;
+@@ -935,7 +935,7 @@
+ 	    }
+ 	    GETLONG(tl,p);
+ 	    if (htonl(tl) != wo->winsaddr[1]) { /* and this is the 2nd one */
+-                DECPTR(sizeof (long),p);
++                DECPTR(sizeof (u_int32_t),p);
+ 		tl = ntohl(wo->winsaddr[1]);
+ 		PUTLONG(tl, p);
+ 		orc = CONFNAK;

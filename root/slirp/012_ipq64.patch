@@ -1,0 +1,53 @@
+Description: fix crashes at startup in 64bit systems
+ Due to the use of 32bit pointers slirp crashes at startup
+ .
+ Thanks to Fernando Toledo for the fix: http://bugs.debian.org/922323
+Author: Roberto Lumbreras <rover@debian.org>
+Bug-Debian: http://bugs.debian.org/948268
+
+Index: slirp-1.0.17/src/ip.h
+===================================================================
+--- slirp-1.0.17.orig/src/ip.h	2020-01-15 22:41:07.978168707 +0100
++++ slirp-1.0.17/src/ip.h	2020-01-15 22:41:07.974168676 +0100
+@@ -193,7 +193,7 @@
+ #if SIZEOF_CHAR_P == 4
+ typedef caddr_t caddr32_t;
+ #else
+-typedef u_int32_t caddr32_t;
++typedef void* caddr32_t;
+ #endif
+ #endif
+ 
+@@ -201,8 +201,8 @@
+ typedef struct ipq *ipqp_32;
+ typedef struct ipasfrag *ipasfragp_32;
+ #else
+-typedef caddr32_t ipqp_32;
+-typedef caddr32_t ipasfragp_32;
++typedef void* ipqp_32;
++typedef void* ipasfragp_32;
+ #endif
+ 
+ /*
+Index: slirp-1.0.17/src/tcp_var.h
+===================================================================
+--- slirp-1.0.17.orig/src/tcp_var.h	2020-01-15 22:41:07.978168707 +0100
++++ slirp-1.0.17/src/tcp_var.h	2020-01-15 22:41:07.974168676 +0100
+@@ -43,7 +43,7 @@
+ #if SIZEOF_CHAR_P == 4
+  typedef struct tcpiphdr *tcpiphdrp_32;
+ #else
+- typedef u_int32_t tcpiphdrp_32;
++ typedef void* tcpiphdrp_32;
+ #endif
+ 
+ /*
+@@ -181,7 +181,7 @@
+ #if SIZEOF_CHAR_P == 4
+ typedef struct mbuf *mbufp_32;
+ #else
+-typedef u_int32_t mbufp_32;
++typedef void* mbufp_32;
+ #endif
+ #define REASS_MBUF(ti) (*(mbufp_32 *)&((ti)->ti_t))
+ 

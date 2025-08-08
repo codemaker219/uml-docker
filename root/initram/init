@@ -1,0 +1,127 @@
+#!/bin/sh
+set -ex
+
+/bin/busybox mkdir -p \
+  /bin \
+  /sbin \
+  /usr/bin \
+  /usr/sbin \
+  /proc \
+  /sys \
+  /dev \
+  /tmp \
+  /etc
+
+/bin/busybox --install -s
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+
+mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
+mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev
+[ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
+mount -t proc -o noexec,nosuid,nodev proc /proc
+[ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
+[ -d /dev/pts ] || mkdir -m 755 /dev/pts
+mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+mkdir -p /dev/shm
+
+mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+
+mount -t cgroup2 none /sys/fs/cgroup
+sync
+
+# shellcheck disable=SC2046
+set -- $(cat /proc/cmdline)
+myopts="uml_sh
+        uml_cwd
+        uml_create_squashfs
+        uml_ssh_port
+    "
+
+for opt; do
+  for i in $myopts; do
+    case "$opt" in
+    $i=*) eval "KOPT_${i}"='${opt#*=}' ;;
+    $i) eval "KOPT_${i}=yes" ;;
+    no$i) eval "KOPT_${i}=no" ;;
+    esac
+  done
+done
+
+busybox mount none /mnt/ -t hostfs -o "${KOPT_uml_cwd:-.}"
+
+cp /slirp /mnt/slirp
+
+ip link set eth0 up
+#ip addr add "$(grep -e 'Your address is' /mnt/tmp/slirp.log | awk '{print $4}' | tr -d '\r')"/24 dev eth0
+#ip route add default via "$(grep -e 'IP address of Slirp host:' /mnt/tmp/slirp.log | awk '{print $6}' | tr -d '\r')"
+
+ip addr add 10.0.2.15/24 dev eth0
+ip route add default via 10.0.2.1
+
+# shellcheck disable=SC2154
+if [ "$KOPT_uml_sh" = yes ]; then
+  exec /bin/busybox init
+fi
+
+mkdir /rootfs
+
+create_roofs() {
+  mkdir -p /mnt/data
+  echo "Create ubuntu based rootfs"
+  modprobe loop
+  dd if=/dev/zero of=/mnt/data/rootfs.img bs=1M count=2000
+  mkfs.ext4 /mnt/data/rootfs.img
+  mount -o loop /mnt/data/rootfs.img /rootfs
+
+  UBUNTU_CODENAME="noble"
+
+  debootstrap --variant=minbase --include=ca-certificates,curl,vim,kmod,openssh-server,iproute2,telnet --arch=amd64 "$UBUNTU_CODENAME" /rootfs http://archive.ubuntu.com/ubuntu
+  cp /etc/resolv.conf /rootfs/etc/
+  install -m 0755 -d /rootfs/etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /rootfs/etc/apt/keyrings/docker.asc
+  chmod a+r /rootfs/etc/apt/keyrings/docker.asc
+  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $UBUNTU_CODENAME stable" >/rootfs/etc/apt/sources.list.d/docker.list
+
+  mount --rbind /dev /rootfs/dev
+  mount --rbind /sys /rootfs/sys
+  mount --rbind /proc /rootfs/proc
+  chroot /rootfs /bin/bash -l -c 'usermod -p "" root && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && echo "PermitEmptyPasswords yes" >> /etc/ssh/sshd_config  && apt-get  update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
+
+  mkdir -p /rootfs/etc/systemd/system/getty.target.wants
+  ln -sf /lib/systemd/system/getty@.service /rootfs/etc/systemd/system/getty.target.wants/getty@tty0.service
+
+  cat >/rootfs/etc/systemd/resolved.conf <<EOF
+[Resolve]
+DNS=10.0.2.3
+Domains=
+EOF
+
+}
+
+if [ "${KOPT_uml_create_squashfs:-no}" = yey ] || [ ! -e /dev/ubda ]; then
+  create_roofs
+  umount -R /rootfs
+  mount -o loop /mnt/data/rootfs.img /rootfs
+else
+  mount /dev/ubda /rootfs
+fi
+
+mkdir -p /rootfs/lib/modules
+cp -r /lib/modules/"$(uname -r)" /rootfs/lib/modules/"$(uname -r)"
+
+# shellcheck disable=SC2002
+# shellcheck disable=SC2034
+cat /proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS; do
+  # shellcheck disable=SC2166
+  if [ "$DIR" != "/" -a "$DIR" != "/rootfs" -a -d "$DIR" ]; then
+    mount -o move "$DIR" rootfs/"$DIR"
+  fi
+done
+
+{
+  echo "redir ${KOPT_uml_ssh_port:-5022} 22"
+  sleep 0.2
+  echo "quit"
+} | telnet 10.0.2.0
+
+exec switch_root /rootfs /sbin/init
