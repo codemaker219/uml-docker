@@ -5,8 +5,8 @@ uml-docker is a proof of concept (PoC) demonstrating how to compile and run the 
 A statically linked single-binary Linux kernel running in user mode, capable of running the Docker daemon (`dockerd`) inside the UML environment.
 
 # Features
-- Build the kernel by simply running ./build.sh. The compiled kernel binary will be available at out/linux.
-- On first boot, the system creates an Ubuntu-based root filesystem.
+- Build the kernel by simply running ./build.sh. The compiled kernel binary will be available at out/linux. (no root required, so I use rootless podman)
+- On first boot, the system creates an Ubuntu-based root filesystem under `$pwd/data/rootfs.img`.
 - Docker is automatically installed inside the root filesystem.
 - OpenSSH server runs inside UML.
 - Host TCP port 5022 is forwarded to port 22 (SSH) inside the UML.
@@ -20,7 +20,7 @@ A statically linked single-binary Linux kernel running in user mode, capable of 
     ```
 2. Start UML (example):
     ```bash
-    ./start-uml.sh
+    ./out/linux
     ```
 3. Connect to Docker inside UML over SSH:
     >Note: Currently, 127.0.0.1 does not work for SSH connections. Use your real IP address instead.
