@@ -52,8 +52,6 @@ busybox mount none /mnt/ -t hostfs -o "${KOPT_uml_cwd:-.}"
 cp /slirp /mnt/slirp
 
 ip link set eth0 up
-#ip addr add "$(grep -e 'Your address is' /mnt/tmp/slirp.log | awk '{print $4}' | tr -d '\r')"/24 dev eth0
-#ip route add default via "$(grep -e 'IP address of Slirp host:' /mnt/tmp/slirp.log | awk '{print $6}' | tr -d '\r')"
 
 ip addr add 10.0.2.15/24 dev eth0
 ip route add default via 10.0.2.1
@@ -98,7 +96,7 @@ EOF
 
 }
 
-if [ "${KOPT_uml_create_squashfs:-no}" = yey ] || [ ! -e /dev/ubda ]; then
+if [ "${KOPT_uml_create_squashfs:-no}" = yes ] || [ ! -e /dev/ubda ]; then
   create_roofs
   umount -R /rootfs
   mount -o loop /mnt/data/rootfs.img /rootfs
