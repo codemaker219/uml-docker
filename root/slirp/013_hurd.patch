@@ -1,0 +1,21 @@
+Description: make it compile on GNU Hurd
+ Quick and dirty fix to make it compile on GNU Hurd.
+ .
+Author: Roberto Lumbreras <rover@debian.org>
+
+Index: slirp-1.0.17/src/ppp/pppd.h
+===================================================================
+--- slirp-1.0.17.orig/src/ppp/pppd.h	2004-09-07 03:50:08.000000000 +0200
++++ slirp-1.0.17/src/ppp/pppd.h	2020-01-15 20:39:48.494566397 +0100
+@@ -34,6 +34,11 @@
+ #include <sys/types.h>		/* for u_int32_t, if defined */
+ #include <ppp/ppp_defs.h>
+ 
++// For GNU Hurd
++#ifndef MAXPATHLEN
++#define MAXPATHLEN	4096
++#endif
++
+ /*
+  * Limits.
+  */

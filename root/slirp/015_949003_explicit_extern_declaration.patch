@@ -1,0 +1,22 @@
+Description: 949003
+
+Author: Bernhard Übelacker <bernhardu@mailbox.org>
+Bug-Debian: https://bugs.debian.org/949003
+Forwarded: no
+Last-Update: 2020-09-02
+
+Index: slirp-1.0.17/src/options.c
+===================================================================
+--- slirp-1.0.17.orig/src/options.c
++++ slirp-1.0.17/src/options.c
+@@ -74,8 +74,8 @@ int     nozeros;                /* If se
+  * Read the config file
+  */
+ 
+-int (*lprint_print) _P((void *, const char *format, va_list));
+-char *lprint_ptr, *lprint_ptr2, **lprint_arg;
++extern int (*lprint_print) _P((void *, const char *format, va_list));
++extern char *lprint_ptr, *lprint_ptr2, **lprint_arg;
+ struct sbuf *lprint_sb;
+ 
+ int cfg_unit;
