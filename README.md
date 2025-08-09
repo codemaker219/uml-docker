@@ -27,6 +27,13 @@ A statically linked single-binary Linux kernel running in user mode, capable of 
     ```bash
     DOCKER_HOST=ssh://root@<your-ip>:5022 docker run -it alpine
     ```
+or simply use a prebuild docker image (so you run a container that runs a uml that can run docker, useful? unlikely!)
+
+```
+# mount a data dir, so you do not need to recreate the rootfs
+podman run -it -p 5022:5022 -v ./data/:/data  ghcr.io/codemaker219/uml-docker:latest
+```
+
 # Requirements
 - Linux host with User-Mode Linux support.
 - Internet access to build the root filesystem.
