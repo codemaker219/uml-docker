@@ -97,7 +97,7 @@ jobs:
       - name: Extract binary from Docker image
         if: ${{ github.event_name != 'pull_request' }}
         run: |
-          id=$(docker create ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          id=$(docker create ${{ fromJSON(steps.meta.outputs.json).tags[0] }})
           docker cp $id:/uml/linux ./linux
           docker rm $id
           ls -lh ./linux
