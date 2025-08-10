@@ -93,3 +93,17 @@ jobs:
         # This step uses the identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+      - name: Extract binary from Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          id=$(docker create ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          docker cp $id:/uml/linux ./linux
+          docker rm $id
+          ls -lh ./linux
+
+      - name: Release
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./linux
